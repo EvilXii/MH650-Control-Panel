@@ -15,7 +15,7 @@ import math
 import os
 import sys
 
-from PyQt6.QtCore import QPointF, QRectF, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QPointF, QProcess, QRectF, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QFont, QPainter, QPen
 from PyQt6.QtWidgets import (
     QApplication, QCheckBox, QColorDialog, QComboBox, QFileDialog, QGridLayout, QGroupBox,
@@ -157,6 +157,7 @@ class MainWindow(QMainWindow):
         self.hid = core.HidLink()
         self.store = core.ProfileStore()
         self.eq_proc = core.FilterProcess("eq", "effect_input.mh650_eq")
+        self.eq_perm = core.PersistentEQ("effect_input.mh650_eq")
         self.sur_proc = core.FilterProcess("surround", "effect_input.mh650_surround")
         self.events = None
         self.t0 = os.times()[4]
@@ -193,7 +194,11 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.page_log(), "LOG")
         self.status = self.statusBar()
 
-        self.eq_debounce = QTimer(self, singleShot=True, interval=120, timeout=self.apply_eq)
+        self.eq_debounce = QTimer(self, singleShot=True, interval=400, timeout=self.apply_eq)   # full apply / persist
+        self.eq_live = QProcess(self)                    # async pw-cli: never blocks the sliders
+        self.eq_live.finished.connect(self._eq_live_done)
+        self._eq_live_pending = None                     # (target, params): only the newest value is kept
+        self._eq_live_target = None
         self.sur_debounce = QTimer(self, singleShot=True, interval=120, timeout=self.apply_surround)
         self.fx_timer = QTimer(self, interval=50, timeout=self.fx_tick)
         self.rot_timer = QTimer(self, interval=100, timeout=self.rot_tick)
@@ -392,8 +397,15 @@ class MainWindow(QMainWindow):
         self.eq_enable.toggled.connect(lambda _: self.eq_debounce.start())
         self.eq_default = QCheckBox("Apply to system output")
         self.eq_default.setChecked(True)
+        self.eq_default.toggled.connect(self.eq_default_toggled)
+        self.eq_keep = QCheckBox("Keep EQ after closing (permanent)")
+        self.eq_keep.setToolTip("Installs the EQ into your PipeWire config so it loads at every login, "
+                                "with or without this app. Turning it off removes it again.")
+        self.eq_keep.setChecked(True)
+        self.eq_keep.toggled.connect(self.eq_keep_toggled)
         left.addWidget(self.eq_enable)
         left.addWidget(self.eq_default)
+        left.addWidget(self.eq_keep)
         left.addStretch(1)
         top.addLayout(left)
 
@@ -446,6 +458,10 @@ class MainWindow(QMainWindow):
             b.clicked.connect(fn)
             row.addWidget(b)
         right.addLayout(row)
+        reset_all = QPushButton("RESET PROFILE TO DEFAULT")
+        reset_all.setToolTip("Restore the whole selected profile (name, all bands, bass and treble) to its factory values and save it")
+        reset_all.clicked.connect(self.eq_reset_profile)
+        right.addWidget(reset_all)
         self.eq_info = QLabel("")
         self.eq_info.setWordWrap(True)
         self.eq_info.setStyleSheet("color:gray;font-size:10px;")
@@ -525,7 +541,52 @@ class MainWindow(QMainWindow):
             self.load_eq_mode(it.data(Qt.ItemDataRole.UserRole))
 
     def eq_edited(self):
+        """Slider moved: push the gains to the running EQ right away; the full apply (file write, restarts)
+        is debounced and only runs once the sliders stop."""
+        try:
+            cmeq = self.current_cmeq()
+        except core.EQError:
+            self.eq_debounce.start()
+            return
+        self.eq_info.setText(self.eq_info_text(cmeq))
+        target = self.live_eq_target()
+        if target is not None:
+            self.send_eq_live(target, core.eq_live_params(cmeq))
         self.eq_debounce.start()
+
+    def eq_info_text(self, cmeq):
+        props = ", ".join(f"{n}={v}" for n, _, v in core.driver_properties(cmeq) if v)
+        return "Driver slots: " + (props or "all 0 (flat)")
+
+    def live_eq_target(self):
+        """The EQ node we can update instantly, or None (then the debounced full apply handles it)."""
+        if not self.eq_enable.isChecked():
+            return None
+        if self.eq_keep.isChecked():
+            return self.eq_perm if self.eq_perm.cached_id is not None else None
+        return self.eq_proc if self.eq_proc.running() and self.eq_proc.cached_id is not None else None
+
+    def send_eq_live(self, target, params):
+        if self.eq_live.state() != QProcess.ProcessState.NotRunning:
+            self._eq_live_pending = (target, params)     # coalesce: newest wins
+            return
+        argv = target.props_argv(params)
+        if not argv:
+            self.eq_debounce.start()
+            return
+        self._eq_live_target = target
+        self.eq_live.start(argv[0], argv[1:])
+
+    def _eq_live_done(self, code, _status):
+        if code != 0 and self._eq_live_target is not None:
+            self._eq_live_target.cached_id = None        # stale node id: the full apply will re-resolve it
+            self._eq_live_pending = None
+            self.eq_debounce.start()
+            return
+        if self._eq_live_pending is not None:
+            target, params = self._eq_live_pending
+            self._eq_live_pending = None
+            self.send_eq_live(target, params)
 
     def add_eq_mode(self):
         name, ok = QInputDialog.getText(self, "ADD NEW PROFILE", "Name:")
@@ -539,6 +600,22 @@ class MainWindow(QMainWindow):
     def eq_reset(self):
         for s in [self.bass, self.treble] + self.band:
             s.setValue(0)
+
+    def eq_reset_profile(self):
+        m = self.store.eq_mode(self.store.eq_cur)
+        factory = next((d for d in core.DEFAULT_EQ_MODES if d["id"] == m["id"]), None)
+        what = "its factory settings" if factory else "flat (this is a custom profile, so default = all zeros)"
+        if QMessageBox.question(self, "Reset profile", f"Reset '{m['name']}' (all bands, bass and treble) to {what}?\n"
+                                "This overwrites the saved profile.") != QMessageBox.StandardButton.Yes:
+            return
+        m["bands"] = list(factory["bands"]) if factory else [0] * 5
+        if factory:
+            m["name"] = factory["name"]
+        self.store.bass = self.store.treble = 0
+        self.store.save()
+        self.fill_lists()
+        self.load_eq_mode(m["id"])
+        self.log(f"profile '{m['name']}' reset to default")
 
     def eq_save(self):
         m = self.store.eq_mode(self.store.eq_cur)
@@ -559,8 +636,10 @@ class MainWindow(QMainWindow):
         except core.EQError as e:
             self.log(f"EQ rejected like the Windows driver would: {e}")
             return
-        props = ", ".join(f"{n}={v}" for n, _, v in core.driver_properties(cmeq) if v)
-        self.eq_info.setText("Driver slots: " + (props or "all 0 (flat)"))
+        self.eq_info.setText(self.eq_info_text(cmeq))
+        if self.eq_keep.isChecked():
+            self.apply_eq_permanent(cmeq)
+            return
         flat = not any(cmeq)
         if not self.eq_enable.isChecked() or flat and not self.eq_proc.running():
             if not self.eq_enable.isChecked():
@@ -577,6 +656,70 @@ class MainWindow(QMainWindow):
             self.log(f"EQ start failed: {e}")
             self.status.showMessage(f"EQ failed: {e}")
 
+    def eq_active(self):
+        return self.eq_proc.running() or self.eq_perm.running()
+
+    def apply_eq_permanent(self, cmeq):
+        """EQ lives in PipeWire itself (drop-in file). 'Disabled' = flat gains, so no restart is needed."""
+        enabled = self.eq_enable.isChecked()
+        installed = core.dropin_installed()
+        if not enabled and not installed:
+            return
+        eff = cmeq if enabled else [0] * len(cmeq)
+        try:
+            sink = self.mh650_sink() or core.dropin_target()
+            if not sink:
+                raise OSError("MH650 audio output not found (is the headset connected?)")
+            if self.eq_proc.running():
+                self.eq_proc.stop()          # the temporary child would clash with the permanent node
+            needs_reload = (not installed) or core.dropin_target() != sink or not self.eq_perm.running()   # also refreshes node id
+            core.write_eq_dropin(eff, sink)  # always rewrite so the next login has the latest gains
+            if needs_reload:
+                self.status.showMessage("Installing permanent EQ (PipeWire restarts briefly)...")
+                core.restart_pipewire()
+                self.eq_perm.cached_id = None
+                if not core.wait_for_node("effect_input.mh650_eq"):
+                    raise OSError("EQ node did not appear after restarting PipeWire (check `journalctl --user -u pipewire`)")
+                self.eq_perm.node_id(refresh=True)
+                self.log(f"permanent EQ installed -> {sink} ({core.dropin_path()})")
+                if self.eq_default.isChecked():
+                    core.set_default_sink("effect_input.mh650_eq")
+                if self.sur_proc.running():
+                    self.sur_debounce.start()
+            elif not self.eq_perm.set_params(core.eq_live_params(eff)):
+                # live update did not take effect: reload PipeWire so the rewritten drop-in is applied
+                self.log("live EQ update did not apply; reloading PipeWire to apply it")
+                self.status.showMessage("Applying EQ (PipeWire restarts briefly)...")
+                core.restart_pipewire()
+                self.eq_perm.cached_id = None
+                if not core.wait_for_node("effect_input.mh650_eq"):
+                    raise OSError("EQ node did not appear after restarting PipeWire (check `journalctl --user -u pipewire`)")
+                self.eq_perm.node_id(refresh=True)
+                if self.eq_default.isChecked():
+                    core.set_default_sink("effect_input.mh650_eq")
+                if self.sur_proc.running():
+                    self.sur_debounce.start()
+        except OSError as e:
+            self.log(f"permanent EQ failed: {e}")
+            self.status.showMessage(f"EQ failed: {e}")
+
+    def eq_keep_toggled(self, on):
+        if not on and core.dropin_installed():
+            try:
+                core.remove_eq_dropin()
+                core.restart_pipewire()
+                self.log("permanent EQ removed")
+            except OSError as e:
+                self.log(f"could not remove permanent EQ: {e}")
+        self.eq_debounce.start()
+
+    def eq_default_toggled(self, on):
+        if not self.eq_active():
+            return
+        sink = "effect_input.mh650_eq" if on else self.mh650_sink()   # off: hand the default back to the headset
+        if sink:
+            core.set_default_sink(sink)
+
     def mh650_sink(self):
         found = core.find_mh650("sinks")
         return found[0] if found else None
@@ -587,6 +730,8 @@ class MainWindow(QMainWindow):
             raise OSError("MH650 audio output not found (is the headset connected and set up in PipeWire?)")
         self.eq_proc.start(core.build_eq_conf(cmeq, sink))
         self.log(f"EQ filter-chain started -> {sink}")
+        core.wait_for_node("effect_input.mh650_eq", timeout=3)
+        self.eq_proc.node_id(refresh=True)
         if self.eq_default.isChecked():
             core.set_default_sink("effect_input.mh650_eq")
         if self.sur_proc.running():
@@ -807,7 +952,7 @@ class MainWindow(QMainWindow):
                 self.sur_proc.stop()
                 self.log("virtual surround stopped")
                 if self.eq_default.isChecked():
-                    core.set_default_sink("effect_input.mh650_eq" if self.eq_proc.running() else (self.mh650_sink() or ""))
+                    core.set_default_sink("effect_input.mh650_eq" if self.eq_active() else (self.mh650_sink() or ""))
             return
         if not self.sofa:
             self.log("virtual surround needs a .sofa HRTF file (choose one on the SURROUND page)")
@@ -815,7 +960,7 @@ class MainWindow(QMainWindow):
         try:
             if self.sur_proc.running() and self.sur_proc.set_params(core.surround_live_params(v)):
                 return
-            target = "effect_input.mh650_eq" if self.eq_proc.running() else self.mh650_sink()
+            target = "effect_input.mh650_eq" if self.eq_active() else self.mh650_sink()
             if not target:
                 raise OSError("MH650 audio output not found")
             self.sur_proc.start(core.build_surround_conf(v, self.sofa, target))
@@ -834,14 +979,16 @@ class MainWindow(QMainWindow):
         self.log_view.setReadOnly(True)
         l.addWidget(self.log_view)
         return w
-    
+
     def closeEvent(self, ev):
         for t in (self.fx_timer, self.rot_timer, self.audio_timer, self.eq_debounce, self.sur_debounce):
             t.stop()
         if self.events:
             self.events.stop()
-        # leave eq_proc / sur_proc running so the effect survives closing the window
-        self.hid.close()
+        self.sur_proc.stop()
+        if not (self.eq_keep.isChecked() and core.dropin_installed()):
+            self.stop_eq()           # permanent EQ lives in PipeWire and keeps running
+        self.hid.close()           # sends the "uninit" packet, handing lighting back to the headset
         ev.accept()
 
 

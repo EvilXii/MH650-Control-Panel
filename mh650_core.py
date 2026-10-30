@@ -470,7 +470,7 @@ def _q(s):
     return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def build_eq_conf(cmeq, target_sink, sink_name="effect_input.mh650_eq"):
+def _eq_module(cmeq, target_sink, sink_name="effect_input.mh650_eq"):
     """filter-chain config: one peaking biquad per USED slot, per channel. Gain = slot value * dB/unit."""
     nodes, links = [], []
     for ch in ("L", "R"):
@@ -484,7 +484,7 @@ def build_eq_conf(cmeq, target_sink, sink_name="effect_input.mh650_eq"):
             prev = n
     first = [f"eq{c}{USED_SLOTS[0]}" for c in "LR"]
     last = [f"eq{c}{USED_SLOTS[-1]}" for c in "LR"]
-    return (FILTER_CHAIN_HEAD + f"""    {{ name = libpipewire-module-filter-chain
+    return (f"""    {{ name = libpipewire-module-filter-chain
       args = {{
         node.description = "MH650 EQ"
         media.name = "MH650 EQ"
@@ -504,8 +504,167 @@ def build_eq_conf(cmeq, target_sink, sink_name="effect_input.mh650_eq"):
         playback.props = {{ node.name = "effect_output.mh650_eq" node.passive = true target.object = {_q(target_sink)} }}
       }}
     }}
-]
 """)
+
+
+def build_eq_conf(cmeq, target_sink, sink_name="effect_input.mh650_eq"):
+    """Standalone config for a private `pipewire -c` child process."""
+    return FILTER_CHAIN_HEAD + _eq_module(cmeq, target_sink, sink_name) + "]\n"
+
+
+# ---- permanent EQ: a drop-in loaded by the user's own PipeWire at every login (no app needed)
+DROPIN_TAG = "# mh650-gui target="
+
+
+def dropin_path():
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "pipewire", "pipewire.conf.d", "mh650-eq.conf")
+
+
+def build_eq_dropin(cmeq, target_sink, sink_name="effect_input.mh650_eq"):
+    return (f"{DROPIN_TAG}{target_sink}\n"
+            "# Written by the MH650 app. Delete this file and restart PipeWire to remove the EQ.\n"
+            "context.modules = [\n" + _eq_module(cmeq, target_sink, sink_name) + "]\n")
+
+
+def dropin_installed():
+    return os.path.isfile(dropin_path())
+
+
+def dropin_target():
+    try:
+        with open(dropin_path()) as f:
+            first = f.readline().strip()
+        return first[len(DROPIN_TAG):] if first.startswith(DROPIN_TAG) else None
+    except OSError:
+        return None
+
+
+def write_eq_dropin(cmeq, target_sink):
+    p = dropin_path()
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    tmp = p + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(build_eq_dropin(cmeq, target_sink))
+    os.replace(tmp, p)
+
+
+def remove_eq_dropin():
+    try:
+        os.remove(dropin_path())
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def restart_pipewire():
+    """Reload the user's PipeWire so it picks up (or drops) the drop-in. Audio blips for ~1 s."""
+    sc = find_bin("systemctl")
+    if not sc:
+        raise OSError("`systemctl` not found: restart PipeWire yourself (or log out and in) to apply the permanent EQ")
+    rc, _, err = run(sc, "--user", "restart", "pipewire", "pipewire-pulse", "wireplumber", timeout=20)
+    if rc != 0:
+        raise OSError(f"could not restart PipeWire: {err.strip()[-300:]}")
+
+
+def find_node_id(node_name):
+    pd = find_bin("pw-dump")
+    if not pd:
+        return None
+    rc, out, _ = run(pd)
+    if rc != 0:
+        return None
+    try:
+        for o in json.loads(out):
+            props = (o.get("info") or {}).get("props") or {}
+            if props.get("node.name") == node_name:
+                return o["id"]
+    except (ValueError, KeyError):
+        return None
+    return None
+
+
+def wait_for_node(node_name, timeout=8.0):
+    end = time.time() + timeout
+    while time.time() < end:
+        if find_node_id(node_name) is not None:
+            return True
+        time.sleep(0.4)
+    return False
+
+
+class NodeProps:
+    """Live-parameter access to a PipeWire node by name. The node id is cached so a slider drag
+    doesn't run `pw-dump` (parses the whole graph) on every change."""
+    node_name = ""
+    cached_id = None
+
+    def node_id(self, refresh=False):
+        if refresh or self.cached_id is None:
+            self.cached_id = find_node_id(self.node_name)
+        return self.cached_id
+
+    def props_argv(self, params):
+        pc = find_bin("pw-cli")
+        nid = self.node_id()
+        if not (pc and nid is not None):
+            return None
+        return [pc, "s", str(nid), "Props", "{ params = [ " + " ".join(params) + " ] }"]
+
+    def read_params(self):
+        """Current Props params of the node as {name: float}, or None if they can't be read."""
+        pd = find_bin("pw-dump")
+        nid = self.node_id()
+        if not pd or nid is None:
+            return None
+        rc, out, _ = run(pd, str(nid))
+        if rc != 0:
+            return None
+        try:
+            found = {}
+            for o in json.loads(out):
+                if o.get("id") != nid:
+                    continue
+                for pr in ((o.get("info") or {}).get("params") or {}).get("Props", []):
+                    flat = pr.get("params") if isinstance(pr, dict) else None
+                    if isinstance(flat, list):
+                        for k, v in zip(flat[0::2], flat[1::2]):
+                            if isinstance(v, (int, float)):
+                                found[str(k)] = float(v)
+            return found or None
+        except (ValueError, KeyError, TypeError):
+            return None
+
+    def set_params(self, params, verify=True):
+        """Live update. pw-cli exits 0 even on failure, so check its output and read the values back.
+        Returns True only if the node really has the new values (or they can't be read back)."""
+        for attempt in (0, 1):
+            argv = self.props_argv(params)
+            if not argv:
+                return False
+            rc, out, err = run(*argv)
+            bad = rc != 0 or "error" in (out + err).lower()
+            if not bad and verify:
+                time.sleep(0.05)
+                have = self.read_params()
+                if have:
+                    want = {params[i].strip('"'): float(params[i + 1]) for i in range(0, len(params), 2)}
+                    bad = any(k in have and abs(have[k] - v) > 0.01 for k, v in want.items())
+            if not bad:
+                return True
+            self.cached_id = None          # stale id: re-resolve once and retry
+        return False
+
+
+class PersistentEQ(NodeProps):
+    """Handle to the EQ node living inside the user's own PipeWire (loaded from the drop-in)."""
+
+    def __init__(self, node_name):
+        self.node_name = node_name
+        self.cached_id = None
+
+    def running(self):
+        return self.node_id(refresh=True) is not None
 
 
 def eq_live_params(cmeq):
@@ -592,13 +751,14 @@ def surround_live_params(virtual, rotate=0):
     return out
 
 
-class FilterProcess:
+class FilterProcess(NodeProps):
     """A private PipeWire instance-less filter-chain: `pipewire -c <conf>` as a child of the app.
     No files in /etc, no PipeWire restart, no root. Killing the child removes the sink."""
 
     def __init__(self, tag, node_name):
         self.tag, self.node_name = tag, node_name
         self.proc = None
+        self.cached_id = None
         self.conf = os.path.join(config_dir(), f"{tag}.conf")
 
     def running(self):
@@ -620,6 +780,7 @@ class FilterProcess:
             raise OSError(f"filter-chain exited immediately: {err.strip()}")
 
     def stop(self):
+        self.cached_id = None
         if self.running():
             self.proc.terminate()
             try:
@@ -627,31 +788,6 @@ class FilterProcess:
             except subprocess.TimeoutExpired:
                 self.proc.kill()
         self.proc = None
-
-    def node_id(self):
-        pd = find_bin("pw-dump")
-        if not pd:
-            return None
-        rc, out, _ = run(pd)
-        if rc != 0:
-            return None
-        try:
-            for o in json.loads(out):
-                props = (o.get("info") or {}).get("props") or {}
-                if props.get("node.name") == self.node_name:
-                    return o["id"]
-        except (ValueError, KeyError):
-            return None
-        return None
-
-    def set_params(self, params):
-        """Live update without restarting. Returns True on success."""
-        pc = find_bin("pw-cli")
-        nid = self.node_id()
-        if not (pc and nid is not None):
-            return False
-        rc, _, _ = run(pc, "s", str(nid), "Props", "{ params = [ " + " ".join(params) + " ] }")
-        return rc == 0
 
 
 # ----------------------------------------------------------------------------- PulseAudio-compatible controls (user-level)
