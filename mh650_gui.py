@@ -1,1127 +1,867 @@
 #!/usr/bin/env python3
 """
-MH650 Control Panel (PyQt6) - experimental, Linux
+MH650 control panel for Linux - modelled on Cooler Master MasterPlus 1.9.6 (MH650 pages).
 
-What is real here, and how it works:
-  * Lighting + button events: HID protocol decoded from MasterPlus (CMUOT.dll). Sent to the
-    vendor HID node (report ID 0xFF, 63 bytes) - auto-detected from /sys/class/hidraw.
-  * Volume / mic: through pactl (PipeWire-Pulse or PulseAudio) on the MH650 sink/source.
-  * Bass / EQ: a PipeWire filter-chain (built-in biquads) written to
-    ~/.config/pipewire/pipewire.conf.d/ and loaded by restarting the user PipeWire stack.
-    Live gain changes use pw-cli after the node exists. On Windows these are driver DSP.
-  * 7.1 virtual surround: same mechanism using PipeWire's HRIR convolver config, pointed
-    at a HeSuVi-format HRIR .wav that you provide.
+Runs as the normal user. The only privileged step is a ONE-TIME udev rule so the logged-in user
+may open the headset's vendor HID node; the app offers to install it via pkexec (--install-udev
+does the same from a terminal). Audio processing runs in a user-owned PipeWire filter-chain
+child process: no /etc files, no PipeWire restart, no root.
 
-Requires: PyQt6, PipeWire (with pipewire-pulse), pactl, pw-cli. Needs access to /dev/hidrawN
-(udev rule: see mh650_protocol.md / findings).
+Pages and labels follow MasterPlus: LIGHTING, SOUND (LEVELS / BASS / TREBLE / EQUALIZER /
+SOUND PROFILES), SURROUND (7.1 SURROUND SOUND PROFILES / 7.1 VIRTUAL SPEAKER PLACEMENT /
+SURROUND SOUND DISTANCE / SURROUND SOUND ROTATION).
 """
-import colorsys
-import glob
-import json
 import math
 import os
-import re
-import select
-import shutil
-import subprocess
 import sys
-import time
 
-from PyQt6.QtCore import QProcess, QSettings, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QColor, QPalette
+from PyQt6.QtCore import QPointF, QRectF, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QColor, QFont, QPainter, QPen
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QColorDialog, QComboBox, QFileDialog, QFormLayout, QGridLayout,
-    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
-    QPushButton, QSlider, QTabWidget, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QColorDialog, QComboBox, QFileDialog, QGridLayout, QGroupBox,
+    QHBoxLayout, QInputDialog, QLabel, QListWidget, QListWidgetItem, QMainWindow, QMenu,
+    QMessageBox, QPlainTextEdit, QPushButton, QSlider, QTabWidget, QVBoxLayout, QWidget,
 )
 
-VID = 0x2516
-CACHE = os.path.expanduser("~/.cache/mh650")
-PW_CONF_D = os.path.expanduser("~/.config/pipewire/pipewire.conf.d")
-EQ_CONF_NAME = "99-mh650-eq.conf"
-SUR_CONF_NAME = "99-mh650-surround.conf"
-EQ_SINK_NAME = "effect_input.mh650_eq"
-SUR_SINK_NAME = "effect_input.mh650_surround"
-
-SURROUND_CONF_CANDIDATES = [
-    "/usr/share/pipewire/filter-chain/sink-virtual-surround-7.1-hesuvi.conf",
-    "/etc/pipewire/filter-chain/sink-virtual-surround-7.1-hesuvi.conf",
-    "/usr/share/pipewire/filter-chain.conf.avail/sink-virtual-surround-7.1-hesuvi.conf",
-]
-
-# Extra dirs often missing when the app is started from a desktop icon / flatpak-ish env
-_EXTRA_BIN_DIRS = [
-    "/usr/bin",
-    "/usr/local/bin",
-    "/bin",
-    "/sbin",
-    "/usr/sbin",
-    os.path.expanduser("~/.local/bin"),
-    "/usr/libexec/pipewire",
-]
+import mh650_core as core
 
 
-def _ensure_path():
-    """Make sure common bin dirs are on PATH for subprocesses (GUI launch often has a thin PATH)."""
-    cur = os.environ.get("PATH", "")
-    parts = cur.split(":") if cur else []
-    for d in _EXTRA_BIN_DIRS:
-        if d and d not in parts and os.path.isdir(d):
-            parts.append(d)
-    os.environ["PATH"] = ":".join(parts)
+# ----------------------------------------------------------------------------- helpers
+def vslider(lo, hi, v=0, h=170):
+    s = QSlider(Qt.Orientation.Vertical)
+    s.setRange(lo, hi)
+    s.setValue(v)
+    s.setMinimumHeight(h)
+    s.setTickPosition(QSlider.TickPosition.TicksRight)
+    s.setTickInterval(5)
+    return s
 
 
-_ensure_path()
-
-
-def find_bin(name):
-    """Locate an executable even when PATH is incomplete."""
-    p = shutil.which(name)
-    if p:
-        return p
-    for d in _EXTRA_BIN_DIRS:
-        cand = os.path.join(d, name)
-        if os.path.isfile(cand) and os.access(cand, os.X_OK):
-            return cand
-    return None
-
-
-PACTL = find_bin("pactl")
-PW_CLI = find_bin("pw-cli")
-SYSTEMCTL = find_bin("systemctl")
-PIPEWIRE = find_bin("pipewire")
-
-
-# --------------------------------------------------------------------------- HID layer
-def pkt(*b):
-    p = bytearray(64)
-    p[: len(b)] = bytes(b)
-    return bytes(p)
-
-
-LIGHT_ENABLE = pkt(0xFF, 0x10, 0x03, 0x00, 0x03, 0x01)
-LIGHT_RELEASE = pkt(0xFF, 0x10, 0x03, 0x00, 0x03, 0x00)
-LIGHT_OFF = pkt(0xFF, 0x10, 0x04, 0x00, 0x00, 0x00, 0x00)
-
-
-def light_color(r, g, b):
-    return pkt(0xFF, 0x10, 0x04, 0x00, r, g, b, 0xFF)
-
-
-def parse_descriptor(raw):
-    i, size, count, rid = 0, 0, 0, 0
-    totals = {}
-    while i < len(raw):
-        b = raw[i]
-        if b == 0xFE:
-            i += 3 + raw[i + 1]
-            continue
-        sz = {0: 0, 1: 1, 2: 2, 3: 4}[b & 3]
-        val = int.from_bytes(raw[i + 1: i + 1 + sz], "little")
-        tag = b & 0xFC
-        if tag == 0x74:
-            size = val
-        elif tag == 0x94:
-            count = val
-        elif tag == 0x84:
-            rid = val
-        elif tag in (0x80, 0x90, 0xB0):
-            kind = {0x80: "input", 0x90: "output", 0xB0: "feature"}[tag]
-            totals[(rid, kind)] = totals.get((rid, kind), 0) + size * count
-        i += 1 + sz
-    return totals
-
-
-def find_control_node():
-    """Cooler Master hidraw node whose descriptor has report ID 0xFF with 63-byte output."""
-    for node in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
-        try:
-            dev = os.path.realpath(os.path.join(node, "device"))
-            vid = pid = None
-            with open(os.path.join(dev, "uevent")) as f:
-                for line in f:
-                    if line.startswith("HID_ID="):
-                        _, v, p = line.strip().split("=")[1].split(":")
-                        vid, pid = int(v, 16), int(p, 16)
-            if vid != VID:
-                continue
-            with open(os.path.join(dev, "report_descriptor"), "rb") as f:
-                totals = parse_descriptor(f.read())
-            if totals.get((0xFF, "output")) == 504:
-                return "/dev/" + os.path.basename(node), pid
-        except (OSError, ValueError):
-            continue
-    return None, None
-
-
-class Lighting:
-    """Owns the HID fd. All methods raise OSError on failure."""
-
-    def __init__(self):
-        self.fd = None
-        self.path = None
-        self.enabled = False
-
-    def connect(self):
-        path, pid = find_control_node()
-        if not path:
-            raise OSError("No MH650 control HID node found (plug in the headset / dongle).")
-        self.fd = os.open(path, os.O_RDWR)
-        self.path = f"{path} (2516:{pid:04x})"
-        return self.path
-
-    def _send(self, data):
-        if self.fd is None:
-            raise OSError("not connected")
-        os.write(self.fd, data)
-
-    def color(self, r, g, b):
-        if not self.enabled:
-            self._send(LIGHT_ENABLE)
-            self.enabled = True
-            time.sleep(0.05)
-        self._send(light_color(r, g, b))
-
-    def off(self):
-        if not self.enabled:
-            self._send(LIGHT_ENABLE)
-            self.enabled = True
-            time.sleep(0.05)
-        self._send(LIGHT_OFF)
-
-    def release(self):
-        if self.fd is not None and self.enabled:
-            try:
-                self._send(LIGHT_RELEASE)
-            finally:
-                self.enabled = False
-
-    def close(self):
-        try:
-            self.release()
-        except OSError:
-            pass
-        if self.fd is not None:
-            os.close(self.fd)
-            self.fd = None
+def column(title, slider, value_label=None):
+    box = QVBoxLayout()
+    box.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+    if value_label is not None:
+        box.addWidget(value_label, alignment=Qt.AlignmentFlag.AlignHCenter)
+    box.addWidget(slider, alignment=Qt.AlignmentFlag.AlignHCenter, stretch=1)
+    lab = QLabel(title)
+    lab.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+    box.addWidget(lab)
+    return box
 
 
 class EventThread(QThread):
-    report = pyqtSignal(str)
+    """Reads headset notifications (FF 10 06 VV) from the vendor channel."""
+    notified = pyqtSignal(int, int)
     failed = pyqtSignal(str)
 
-    def __init__(self, path):
+    def __init__(self, link):
         super().__init__()
-        self.path = path
-        self._run = True
+        self.link = link
+        self._stop = False
 
     def run(self):
-        try:
-            fd = os.open(self.path, os.O_RDONLY | os.O_NONBLOCK)
-        except OSError as e:
-            self.failed.emit(str(e))
-            return
-        try:
-            while self._run:
-                r, _, _ = select.select([fd], [], [], 0.3)
-                if not r:
-                    continue
-                data = os.read(fd, 64)
-                note = ""
-                for off in (0, 1):
-                    if len(data) > off + 2 and data[off] == 0x10 and data[off + 1] == 0x06:
-                        note = f"   <- notification value=0x{data[off + 2]:02x}"
-                        break
-                self.report.emit(data.hex(" ") + note)
-        except OSError as e:
-            self.failed.emit(str(e))
-        finally:
-            os.close(fd)
+        while not self._stop:
+            try:
+                ev = self.link.read_event(0.2)
+            except OSError as e:
+                self.failed.emit(str(e))
+                return
+            if ev:
+                self.notified.emit(*ev)
 
     def stop(self):
-        self._run = False
+        self._stop = True
         self.wait(1000)
 
 
-# --------------------------------------------------------------------------- audio / PipeWire helpers
-def sh(*args, timeout=8):
-    try:
-        env = os.environ.copy()
-        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=env)
-        return r.stdout or "", r.stderr or "", r.returncode
-    except (OSError, subprocess.SubprocessError) as e:
-        return "", str(e), 1
+class StageWidget(QWidget):
+    """7.1 VIRTUAL SPEAKER PLACEMENT: drag a speaker to change its angle and distance."""
+    changed = pyqtSignal()
+    selected = pyqtSignal(int)
+
+    def __init__(self):
+        super().__init__()
+        self.setMinimumSize(300, 300)
+        self.angles = list(core.VIRTUAL_DEFAULT["angle"])
+        self.dists = [30] * 8
+        self.sel = 1
+        self.setMouseTracking(False)
+
+    def _geom(self):
+        r = min(self.width(), self.height()) / 2 - 26
+        return QPointF(self.width() / 2, self.height() / 2), max(r, 40)
+
+    def _pos(self, i):
+        c, R = self._geom()
+        r = R * (0.2 + 0.8 * min(max(self.dists[i], 0), 100) / 100.0)
+        a = math.radians(self.angles[i])
+        return QPointF(c.x() + r * math.sin(a), c.y() - r * math.cos(a))
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        c, R = self._geom()
+        pal = self.palette()
+        p.setPen(QPen(pal.mid().color(), 1, Qt.PenStyle.DashLine))
+        for k in (0.4, 0.7, 1.0):
+            p.drawEllipse(c, R * k, R * k)
+        p.setPen(QPen(pal.text().color(), 2))
+        p.setBrush(pal.base())
+        p.drawEllipse(c, 16, 16)
+        p.drawLine(QPointF(c.x(), c.y() - 16), QPointF(c.x(), c.y() - 24))      # nose = front
+        f = QFont(self.font())
+        f.setPointSize(8)
+        p.setFont(f)
+        for i, name in enumerate(core.SPEAKERS):
+            q = self._pos(i)
+            col = pal.highlight().color() if i == self.sel else QColor(90, 140, 220)
+            p.setPen(QPen(col.darker(130), 2))
+            p.setBrush(col)
+            p.drawEllipse(q, 13, 13)
+            p.setPen(QColor("white"))
+            p.drawText(QRectF(q.x() - 14, q.y() - 9, 28, 18), Qt.AlignmentFlag.AlignCenter, name)
+
+    def _nearest(self, pt):
+        d = [(math.hypot(pt.x() - self._pos(i).x(), pt.y() - self._pos(i).y()), i) for i in range(8)]
+        dist, i = min(d)
+        return i if dist < 24 else None
+
+    def mousePressEvent(self, e):
+        i = self._nearest(e.position())
+        if i is not None:
+            self.sel = i
+            self.selected.emit(i)
+            self.update()
+
+    def mouseMoveEvent(self, e):
+        c, R = self._geom()
+        dx, dy = e.position().x() - c.x(), e.position().y() - c.y()
+        ang = int(round(math.degrees(math.atan2(dx, -dy))))
+        self.angles[self.sel] = core.wrap_angle(ang)
+        r = math.hypot(dx, dy) / R
+        self.dists[self.sel] = int(max(0, min(100, (r - 0.2) / 0.8 * 100)))
+        self.update()
+        self.changed.emit()
+
+    def set_data(self, angles, dists):
+        self.angles, self.dists = list(angles), list(dists)
+        self.update()
 
 
-def sh_out(*args, timeout=8):
-    out, _, _ = sh(*args, timeout=timeout)
-    return out
-
-
-def tools_ok():
-    """Return (ok, message). Re-resolves bins in case PATH was fixed later."""
-    global PACTL, PW_CLI, SYSTEMCTL
-    if not PACTL:
-        PACTL = find_bin("pactl")
-    if not PW_CLI:
-        PW_CLI = find_bin("pw-cli")
-    if not SYSTEMCTL:
-        SYSTEMCTL = find_bin("systemctl")
-    missing = []
-    if not PACTL:
-        missing.append("pactl")
-    if not PW_CLI:
-        missing.append("pw-cli")
-    if missing:
-        return False, (
-            f"{', '.join(missing)} not found in PATH or common locations.\n"
-            "Install pipewire-pulse + pipewire-utils (or pipewire-bin), then restart this app.\n"
-            f"Current PATH={os.environ.get('PATH', '')}"
-        )
-    return True, ""
-
-
-def pa_names(kind):
-    if not PACTL:
-        return []
-    out = []
-    for line in sh_out(PACTL, "list", "short", kind).splitlines():
-        parts = line.split("\t")
-        if len(parts) > 1:
-            out.append(parts[1])
-    return out
-
-
-def find_mh650(kind):
-    for n in pa_names(kind):
-        if re.search(r"mh650|cooler.?master", n, re.I) and not n.endswith(".monitor"):
-            return n
-    return None
-
-
-def find_sink_by_name(name):
-    for n in pa_names("sinks"):
-        if n == name or name in n:
-            return n
-    return None
-
-
-def pa_volume(kind, name):
-    if not PACTL:
-        return None
-    out = sh_out(PACTL, f"get-{kind[:-1]}-volume", name)
-    m = re.search(r"(\d+)%", out)
-    return int(m.group(1)) if m else None
-
-
-def pa_muted(kind, name):
-    if not PACTL:
-        return False
-    return "yes" in sh_out(PACTL, f"get-{kind[:-1]}-mute", name)
-
-
-def restart_pipewire(log_fn):
-    """Restart the user PipeWire stack so conf.d changes are picked up."""
-    services = ["pipewire", "wireplumber", "pipewire-pulse"]
-    if SYSTEMCTL:
-        for svc in services:
-            out, err, rc = sh(SYSTEMCTL, "--user", "restart", svc)
-            if rc != 0 and (err or out):
-                log_fn(f"systemctl restart {svc}: {(err or out).strip()}")
-        time.sleep(1.2)
-        if PACTL:
-            for _ in range(15):
-                if sh_out(PACTL, "info"):
-                    return True
-                time.sleep(0.4)
-            log_fn("PipeWire restarted but pactl is not responding yet.")
-            return False
-        return True
-    log_fn("systemctl not found; cannot restart PipeWire automatically.")
-    return False
-
-
-def remove_conf(name, log_fn):
-    path = os.path.join(PW_CONF_D, name)
-    if os.path.isfile(path):
-        try:
-            os.remove(path)
-            log_fn(f"Removed {path}")
-            return True
-        except OSError as e:
-            log_fn(f"Could not remove {path}: {e}")
-    return False
-
-
-def write_conf(name, text, log_fn):
-    os.makedirs(PW_CONF_D, exist_ok=True)
-    path = os.path.join(PW_CONF_D, name)
-    with open(path, "w") as f:
-        f.write(text)
-    log_fn(f"Wrote {path}")
-    return path
-
-
-def pw_node_id_by_name(node_name):
-    """Return numeric node id for a PipeWire node.name, or None."""
-    if not PW_CLI:
-        return None
-    out = sh_out(PW_CLI, "ls", "Node")
-    current_id = None
-    for line in out.splitlines():
-        m = re.match(r"\s*id\s+(\d+),", line)
-        if m:
-            current_id = m.group(1)
-            continue
-        if current_id and f'node.name = "{node_name}"' in line:
-            return current_id
-    dump_bin = find_bin("pw-dump")
-    if dump_bin:
-        dump = sh_out(dump_bin)
-        if dump:
-            try:
-                data = json.loads(dump)
-                for obj in data:
-                    if obj.get("type") == "PipeWire:Interface:Node":
-                        props = (obj.get("info") or {}).get("props") or {}
-                        if props.get("node.name") == node_name:
-                            return str(obj.get("id"))
-            except (json.JSONDecodeError, TypeError, KeyError):
-                pass
-    return None
-
-
-def pw_set_eq_gains(node_id, bass, bands, treble, log_fn):
-    """Update live control values on an already-loaded EQ filter-chain."""
-    if not PW_CLI:
-        log_fn("pw-cli not available")
-        return False
-    params = [
-        f'"bass:Gain" {float(bass):.1f}',
-        f'"treble:Gain" {float(treble):.1f}',
-    ]
-    for i, g in enumerate(bands):
-        params.append(f'"band{i}:Gain" {float(g):.1f}')
-    arg = "{ params = [ " + " ".join(params) + " ] }"
-    out, err, rc = sh(PW_CLI, "s", str(node_id), "Props", arg)
-    if rc != 0:
-        log_fn(f"pw-cli set gains failed: {(err or out).strip()}")
-        return False
-    return True
-
-
-EQ_FREQS = [31, 62, 125, 250, 500, 1000, 2000, 4000, 8000, 16000]
-EQ_PRESETS = {
-    "Flat": (0, [0] * 10, 0),
-    "Bass boost": (6, [5, 4, 3, 1, 0, 0, 0, 0, 0, 0], 0),
-    "FPS footsteps": (-2, [-5, -4, -3, -2, -1, 0, 2, 4, 3, 1], 1),
-    "Vocal / voice": (-2, [-3, -2, -1, 0, 2, 4, 4, 2, 0, -1], 0),
-    "Bright": (-1, [-2, -1, 0, 0, 0, 1, 2, 4, 5, 6], 3),
-    "Movie": (4, [4, 3, 2, 0, -1, -1, 0, 2, 3, 3], 2),
-}
-
-
-def build_eq_conf(bass, bands, treble, target_sink):
-    """
-    Build a full pipewire.conf.d snippet that loads libpipewire-module-filter-chain
-    with a 12-node biquad chain (bass shelf + 10 peaking + treble shelf).
-    """
-    chain = [("bass", "bq_lowshelf", 100, 0.7, bass)]
-    chain += [(f"band{i}", "bq_peaking", f, 1.1, g) for i, (f, g) in enumerate(zip(EQ_FREQS, bands))]
-    chain += [("treble", "bq_highshelf", 12000, 0.7, treble)]
-
-    nodes_lines = []
-    for n, lab, fq, q, g in chain:
-        nodes_lines.append(
-            f'                    {{ type = builtin name = {n} label = {lab}\n'
-            f'                      control = {{ "Freq" = {fq} "Q" = {q} "Gain" = {g:.1f} }} }}'
-        )
-    nodes = "\n".join(nodes_lines)
-
-    links_lines = []
-    for i in range(len(chain) - 1):
-        links_lines.append(
-            f'                    {{ output = "{chain[i][0]}:Out" input = "{chain[i + 1][0]}:In" }}'
-        )
-    links = "\n".join(links_lines)
-
-    target_line = ""
-    if target_sink:
-        target_line = f'\n                target.object = "{target_sink}"'
-
-    return f"""# MH650 EQ – managed by mh650_gui.py. Do not edit by hand while the GUI is open.
-context.modules = [
-    {{ name = libpipewire-module-filter-chain
-        flags = [ nofail ]
-        args = {{
-            node.description = "MH650 EQ"
-            media.name       = "MH650 EQ"
-            filter.graph = {{
-                nodes = [
-{nodes}
-                ]
-                links = [
-{links}
-                ]
-            }}
-            audio.channels = 2
-            audio.position = [ FL FR ]
-            capture.props = {{
-                node.name   = "{EQ_SINK_NAME}"
-                media.class = Audio/Sink
-                node.nick   = "MH650 EQ"
-            }}
-            playback.props = {{
-                node.name    = "effect_output.mh650_eq"
-                node.passive = true
-                audio.channels = 2
-                audio.position = [ FL FR ]{target_line}
-            }}
-        }}
-    }}
-]
-"""
-
-
-def build_surround_conf(hrir_path, target_sink):
-    """
-    Load the stock HeSuVi 7.1 filter-chain template, rewrite the HRIR filename
-    to an absolute path, give unique node names, and optionally target the
-    physical MH650 sink.
-    """
-    template = None
-    for p in SURROUND_CONF_CANDIDATES:
-        if os.path.isfile(p):
-            with open(p) as f:
-                template = f.read()
-            break
-    if not template:
-        raise RuntimeError(
-            "PipeWire's sink-virtual-surround-7.1-hesuvi.conf was not found.\n"
-            "Install a recent PipeWire package that ships filter-chain examples, "
-            "or copy the file from the PipeWire sources into one of:\n  "
-            + "\n  ".join(SURROUND_CONF_CANDIDATES)
-        )
-
-    # Absolute path, escaped for SPA-JSON string
-    hrir_abs = os.path.abspath(hrir_path).replace("\\", "/")
-    text, n = re.subn(
-        r'filename\s*=\s*"[^"]*"',
-        f'filename = "{hrir_abs}"',
-        template,
-    )
-    if n == 0:
-        raise RuntimeError("Could not find any 'filename = \"...\"' lines in the surround template.")
-
-    # Unique node names so we don't clash with a user-installed copy
-    text = text.replace(
-        "effect_input.virtual-surround-7.1-hesuvi",
-        SUR_SINK_NAME,
-    )
-    text = text.replace(
-        "effect_output.virtual-surround-7.1-hesuvi",
-        "effect_output.mh650_surround",
-    )
-    text = text.replace("Virtual Surround Sink", "MH650 Virtual Surround")
-    text = text.replace("node.description = \"Virtual Surround Sink\"",
-                        'node.description = "MH650 Virtual Surround"')
-
-    # Inject target.object into playback.props if we know the hardware sink
-    if target_sink:
-        # Insert before the closing of playback.props if not already present
-        if "target.object" not in text:
-            text = re.sub(
-                r'(playback\.props\s*=\s*\{)',
-                rf'\1\n                target.object = "{target_sink}"',
-                text,
-                count=1,
-            )
-
-    # Ensure flags = [ nofail ] is present
-    if "flags = [ nofail ]" not in text and "flags = [nofail]" not in text:
-        text = text.replace(
-            "name = libpipewire-module-filter-chain",
-            "name = libpipewire-module-filter-chain\n        flags = [ nofail ]",
-            1,
-        )
-
-    return text, n
-
-
-# --------------------------------------------------------------------------- UI
+# ----------------------------------------------------------------------------- main window
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MH650 Control Panel (experimental)")
-        self.resize(780, 660)
-        self.cfg = QSettings("mh650-linux", "gui")
-        self.light = Lighting()
+        self.setWindowTitle("MH650")
+        self.resize(900, 720)
+        self.hid = core.HidLink()
+        self.store = core.ProfileStore()
+        self.eq_proc = core.FilterProcess("eq", "effect_input.mh650_eq")
+        self.sur_proc = core.FilterProcess("surround", "effect_input.mh650_surround")
         self.events = None
-        self.t0 = time.time()
-        self.fx_timer = QTimer(self, interval=40)
-        self.fx_timer.timeout.connect(self.fx_tick)
-        self.eq_node_id = None
-        self.eq_active = False
-        self.sur_active = False
+        self.t0 = os.times()[4]
+        self.fx_rgb = (255, 0, 0)
+        self.last_sent = None
+        self.rot_dir = 0
+        self.sofa = core.sofa_search()
 
-        tabs = QTabWidget()
-        tabs.addTab(self.tab_lighting(), "Lighting")
-        tabs.addTab(self.tab_sound(), "Sound")
-        tabs.addTab(self.tab_eq(), "EQ / Bass")
-        tabs.addTab(self.tab_surround(), "7.1 Surround")
-        tabs.addTab(self.tab_log(), "Events / Log")
-        self.setCentralWidget(tabs)
-        self.statusBar().showMessage("Not connected")
-        QTimer.singleShot(100, self._log_tools)
-        QTimer.singleShot(200, self.connect_device)
-        QTimer.singleShot(300, self.refresh_audio)
-        QTimer.singleShot(500, self.detect_existing_filters)
+        # working copies (SAVE persists them, CANCEL discards them)
+        self.eq_cur = {}
+        self.virt_cur = {}
 
-    def _log_tools(self):
-        self.log(f"pactl  = {PACTL or 'NOT FOUND'}")
-        self.log(f"pw-cli = {PW_CLI or 'NOT FOUND'}")
-        self.log(f"PATH   = {os.environ.get('PATH', '')}")
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        self.banner = QLabel()
+        self.banner.setWordWrap(True)
+        self.banner.setStyleSheet("background:#5a3b00;color:#ffd9a0;padding:8px;border-radius:4px;")
+        self.banner_btn = QPushButton("Fix permissions (one-time, asks for your password)")
+        self.banner_btn.clicked.connect(self.install_udev)
+        bl = QHBoxLayout()
+        bl.addWidget(self.banner, 1)
+        bl.addWidget(self.banner_btn)
+        self.banner_wrap = QWidget()
+        self.banner_wrap.setLayout(bl)
+        self.banner_wrap.hide()
+        root.addWidget(self.banner_wrap)
 
-    # ---- helpers
+        self.tabs = QTabWidget()
+        root.addWidget(self.tabs)
+        self.tabs.addTab(self.page_lighting(), "LIGHTING")
+        self.tabs.addTab(self.page_sound(), "SOUND")
+        self.tabs.addTab(self.page_surround(), "SURROUND")
+        self.tabs.addTab(self.page_log(), "LOG")
+        self.status = self.statusBar()
+
+        self.eq_debounce = QTimer(self, singleShot=True, interval=120, timeout=self.apply_eq)
+        self.sur_debounce = QTimer(self, singleShot=True, interval=120, timeout=self.apply_surround)
+        self.fx_timer = QTimer(self, interval=50, timeout=self.fx_tick)
+        self.rot_timer = QTimer(self, interval=100, timeout=self.rot_tick)
+        self.audio_timer = QTimer(self, interval=3000, timeout=self.refresh_audio)
+        self.audio_timer.start()
+
+        self.log("Running as uid %d (root is not required)." % os.getuid())
+        if os.getuid() == 0:
+            self.log("WARNING: you are running as root; this is unnecessary and not recommended.")
+        self.load_profile_into_ui()
+        self.connect_device()
+        self.refresh_audio()
+
+    # ------------------------------------------------------------------ logging / device
     def log(self, text):
-        self.logbox.appendPlainText(f"{time.strftime('%H:%M:%S')}  {text}")
-
-    def warn(self, text):
-        self.statusBar().showMessage(text, 10000)
-        self.log(text)
+        self.log_view.appendPlainText(text)
 
     def connect_device(self):
+        self.banner_wrap.hide()
         try:
-            path = self.light.connect()
-        except OSError as e:
-            msg = str(e)
-            if isinstance(e, PermissionError):
-                msg = ("Permission denied opening the HID node. Add a udev rule "
-                       "(KERNEL==\"hidraw*\", ATTRS{idVendor}==\"2516\", MODE=\"0660\", TAG+=\"uaccess\") "
-                       "and replug, or run with sudo.")
-            self.statusBar().showMessage(msg)
-            self.log(msg)
-            return
-        self.statusBar().showMessage(f"Connected: {path}")
-        self.log(f"Connected to {path}")
-        self.events = EventThread(self.light.path.split(" ")[0])
-        self.events.report.connect(self.log)
-        self.events.failed.connect(lambda m: self.log(f"event listener stopped: {m}"))
-        self.events.start()
-
-    def hid(self, fn, *a):
-        try:
-            if self.light.fd is None:
-                self.connect_device()
-            fn(*a)
-            return True
-        except OSError as e:
-            self.fx_timer.stop()
-            self.warn(f"HID write failed: {e}")
+            where = self.hid.connect()
+        except core.PermissionProblem as e:
+            self.banner.setText(f"The headset control channel exists but your user may not open it ({e}). "
+                                "Install the udev rule once; after that this app never needs root.")
+            self.banner_wrap.show()
+            self.status.showMessage("No access to headset control channel")
+            self.log(f"Permission denied: {e}")
             return False
+        except OSError as e:
+            self.status.showMessage(str(e))
+            self.log(str(e))
+            return False
+        self.status.showMessage(f"Connected: {where}")
+        self.log(f"Connected: {where}")
+        self.events = EventThread(self.hid)
+        self.events.notified.connect(lambda t, v: self.log(f"notification type={t} value=0x{v:02x}"))
+        self.events.failed.connect(lambda m: self.log(f"event reader stopped: {m}"))
+        self.events.start()
+        return True
 
-    def detect_existing_filters(self):
-        if find_sink_by_name(EQ_SINK_NAME):
-            self.eq_active = True
-            self.eq_node_id = pw_node_id_by_name(EQ_SINK_NAME)
-            self.eq_status.setText(f"EQ active (node {self.eq_node_id or '?'})")
-            self.log(f"Detected existing EQ sink {EQ_SINK_NAME}")
-        if find_sink_by_name(SUR_SINK_NAME):
-            self.sur_active = True
-            self.sur_status.setText("7.1 active")
-            self.log(f"Detected existing surround sink {SUR_SINK_NAME}")
+    def install_udev(self):
+        try:
+            core.install_udev_rule_with_pkexec()
+        except OSError as e:
+            QMessageBox.warning(self, "udev rule", f"Could not install the rule:\n{e}")
+            return
+        self.log("udev rule installed; reconnecting")
+        QTimer.singleShot(800, self.connect_device)
 
-    # ---- lighting
-    def tab_lighting(self):
+    # ------------------------------------------------------------------ LIGHTING
+    def page_lighting(self):
         w = QWidget()
-        lay = QVBoxLayout(w)
-        box = QGroupBox("Color")
-        g = QGridLayout(box)
+        g = QGridLayout(w)
+        self.fx_combo = QComboBox()
+        for eid, name in core.EFFECTS:
+            self.fx_combo.addItem(name, eid)
+        self.fx_combo.currentIndexChanged.connect(self.fx_changed)
+        self.color_btn = QPushButton("Pick colour")
+        self.color_btn.clicked.connect(self.pick_color)
         self.swatch = QLabel()
-        self.swatch.setFixedSize(70, 40)
-        self.hex = QLineEdit(self.cfg.value("color", "#FF0000"))
-        self.hex.setMaximumWidth(110)
-        self.hex.editingFinished.connect(self.color_changed)
-        pick = QPushButton("Pick...")
-        pick.clicked.connect(self.pick_color)
-        g.addWidget(self.swatch, 0, 0)
-        g.addWidget(self.hex, 0, 1)
-        g.addWidget(pick, 0, 2)
-        presets = ["#FF0000", "#FF7F00", "#FFFF00", "#00FF00", "#00FFFF", "#0000FF", "#8000FF", "#FF00AA", "#FFFFFF"]
-        row = QHBoxLayout()
-        for c in presets:
-            b = QPushButton()
-            b.setFixedSize(30, 26)
-            b.setStyleSheet(f"background:{c}; border:1px solid #555;")
-            b.clicked.connect(lambda _=False, c=c: self.set_hex(c))
-            row.addWidget(b)
-        row.addStretch()
-        g.addLayout(row, 1, 0, 1, 3)
-        lay.addWidget(box)
-
-        fx = QGroupBox("Effect (software-animated)")
-        f = QFormLayout(fx)
-        self.fx = QComboBox()
-        self.fx.addItems(["Static", "Breathing", "Color cycle", "Strobe"])
-        self.fx.setCurrentText(self.cfg.value("fx", "Static"))
-        self.bright = QSlider(Qt.Orientation.Horizontal)
-        self.bright.setRange(5, 100)
-        self.bright.setValue(int(self.cfg.value("bright", 100)))
-        self.speed = QSlider(Qt.Orientation.Horizontal)
-        self.speed.setRange(1, 10)
-        self.speed.setValue(int(self.cfg.value("speed", 4)))
-        f.addRow("Effect", self.fx)
-        f.addRow("Brightness", self.bright)
-        f.addRow("Speed", self.speed)
-        lay.addWidget(fx)
-
-        btns = QHBoxLayout()
-        for text, fn in (("Apply", self.apply_light), ("Lights off", self.light_off),
-                         ("Release to headset", self.light_release)):
-            b = QPushButton(text)
-            b.clicked.connect(fn)
-            btns.addWidget(b)
-        lay.addLayout(btns)
-        note = QLabel("Sets one color for all LEDs (the only lighting command decoded so far). Effects are "
-                      "animated by this app, so they stop when it closes; 'Release' returns control to the headset.")
-        note.setWordWrap(True)
-        lay.addWidget(note)
-        lay.addStretch()
+        self.swatch.setFixedSize(48, 24)
         self.paint_swatch()
+        self.dim = QSlider(Qt.Orientation.Horizontal)
+        self.dim.setRange(0, 100)
+        self.dim.setValue(100)
+        self.speed = QSlider(Qt.Orientation.Horizontal)
+        self.speed.setRange(1, 5)
+        self.speed.setValue(3)
+        self.direction = QComboBox()
+        self.direction.addItems(["Clockwise", "Counter-clockwise"])
+        self.fx_note = QLabel()
+        self.fx_note.setWordWrap(True)
+        g.addWidget(QLabel("Effect"), 0, 0)
+        g.addWidget(self.fx_combo, 0, 1, 1, 2)
+        g.addWidget(QLabel("Colour"), 1, 0)
+        g.addWidget(self.color_btn, 1, 1)
+        g.addWidget(self.swatch, 1, 2)
+        g.addWidget(QLabel("Dim"), 2, 0)
+        g.addWidget(self.dim, 2, 1, 1, 2)
+        g.addWidget(QLabel("Speed"), 3, 0)
+        g.addWidget(self.speed, 3, 1, 1, 2)
+        g.addWidget(QLabel("Direction"), 4, 0)
+        g.addWidget(self.direction, 4, 1, 1, 2)
+        g.addWidget(self.fx_note, 5, 0, 1, 3)
+        apply_b = QPushButton("Apply")
+        apply_b.clicked.connect(self.apply_light)
+        off_b = QPushButton("Turn Off")
+        off_b.clicked.connect(self.light_off)
+        rel_b = QPushButton("Release (back to headset control)")
+        rel_b.clicked.connect(self.light_release)
+        row = QHBoxLayout()
+        for b in (apply_b, off_b, rel_b):
+            row.addWidget(b)
+        g.addLayout(row, 6, 0, 1, 3)
+        g.setRowStretch(7, 1)
+        self.fx_changed()
         return w
 
-    def cur_rgb(self):
-        c = QColor(self.hex.text())
-        if not c.isValid():
-            c = QColor("#FF0000")
-        return c.red(), c.green(), c.blue()
-
     def paint_swatch(self):
-        r, g, b = self.cur_rgb()
-        self.swatch.setStyleSheet(f"background: rgb({r},{g},{b}); border:1px solid #555;")
-
-    def set_hex(self, c):
-        self.hex.setText(c)
-        self.color_changed()
-        self.apply_light()
-
-    def color_changed(self):
-        self.paint_swatch()
-        self.cfg.setValue("color", self.hex.text())
+        self.swatch.setStyleSheet("background:#%02x%02x%02x;border:1px solid #888;" % self.fx_rgb)
 
     def pick_color(self):
-        c = QColorDialog.getColor(QColor(self.hex.text()), self, "Headset color")
+        c = QColorDialog.getColor(QColor(*self.fx_rgb), self)
         if c.isValid():
-            self.set_hex(c.name().upper())
+            self.fx_rgb = (c.red(), c.green(), c.blue())
+            self.paint_swatch()
 
-    def scaled(self, rgb, k):
-        return tuple(max(0, min(255, int(v * k))) for v in rgb)
+    def fx_changed(self):
+        eid = self.fx_combo.currentData()
+        if eid in core.UNSUPPORTED_EFFECTS:
+            self.fx_note.setText("Customization needs per-LED packets. The MH650 firmware path only exposes a single "
+                                 "colour command (setSyncLightingData is an empty stub), so this cannot be applied.")
+        elif eid in core.APPROXIMATED_EFFECTS:
+            self.fx_note.setText("This pattern is animated by the host on Windows. Only one colour can be sent, so it "
+                                 "is shown as a single-colour approximation.")
+        else:
+            self.fx_note.setText("Rendered as a host-driven single-colour stream, as MasterPlus does.")
 
     def apply_light(self):
-        self.cfg.setValue("fx", self.fx.currentText())
-        self.cfg.setValue("bright", self.bright.value())
-        self.cfg.setValue("speed", self.speed.value())
-        self.t0 = time.time()
-        if self.fx.currentText() == "Static":
+        eid = self.fx_combo.currentData()
+        if eid in core.UNSUPPORTED_EFFECTS:
+            QMessageBox.information(self, "Customization", self.fx_note.text())
+            return
+        if self.hid.fd is None and not self.connect_device():
+            return
+        self.t0 = os.times()[4]
+        self.last_sent = None
+        if eid in (0, 6):
             self.fx_timer.stop()
-            self.hid(lambda: self.light.color(*self.scaled(self.cur_rgb(), self.bright.value() / 100)))
+            self.send_color(*core.effect_color(eid, 0, self.fx_rgb, self.dim.value()))
         else:
             self.fx_timer.start()
 
     def fx_tick(self):
-        t = (time.time() - self.t0) * (0.4 + self.speed.value() * 0.35)
-        k = self.bright.value() / 100
-        mode = self.fx.currentText()
-        r, g, b = self.cur_rgb()
-        if mode == "Breathing":
-            k *= 0.08 + 0.92 * (math.sin(t * math.pi * 2 - math.pi / 2) + 1) / 2
-            rgb = self.scaled((r, g, b), k)
-        elif mode == "Color cycle":
-            rr, gg, bb = colorsys.hsv_to_rgb((t * 0.25) % 1.0, 1.0, 1.0)
-            rgb = self.scaled((rr * 255, gg * 255, bb * 255), k)
-        else:  # Strobe
-            rgb = self.scaled((r, g, b), k) if int(t * 4) % 2 == 0 else (0, 0, 0)
-        self.hid(lambda: self.light.color(*rgb))
+        eid = self.fx_combo.currentData()
+        t = os.times()[4] - self.t0
+        self.send_color(*core.effect_color(eid, t, self.fx_rgb, self.dim.value(), self.speed.value(),
+                                           self.direction.currentIndex()))
+
+    def send_color(self, r, g, b):
+        if (r, g, b) == self.last_sent:
+            return
+        try:
+            if (r, g, b) == (0, 0, 0):
+                self.hid.off()
+            else:
+                self.hid.color(r, g, b)
+            self.last_sent = (r, g, b)
+        except OSError as e:
+            self.fx_timer.stop()
+            self.log(f"lighting write failed: {e}")
+            self.status.showMessage(f"Lighting write failed: {e}")
 
     def light_off(self):
         self.fx_timer.stop()
-        self.hid(self.light.off)
+        self.send_color(0, 0, 0)
 
     def light_release(self):
         self.fx_timer.stop()
-        self.hid(self.light.release)
+        try:
+            self.hid.release()
+            self.last_sent = None
+        except OSError as e:
+            self.log(f"release failed: {e}")
 
-    # ---- sound
-    def tab_sound(self):
+    # ------------------------------------------------------------------ SOUND
+    def page_sound(self):
         w = QWidget()
-        lay = QVBoxLayout(w)
-        self.snd_info = QLabel("")
-        lay.addWidget(self.snd_info)
-        out = QGroupBox("Headphones (output)")
-        o = QHBoxLayout(out)
-        self.vol = QSlider(Qt.Orientation.Horizontal)
-        self.vol.setRange(0, 150)
-        self.vol_lbl = QLabel("0%")
-        self.vol_mute = QCheckBox("Mute")
-        o.addWidget(self.vol)
-        o.addWidget(self.vol_lbl)
-        o.addWidget(self.vol_mute)
-        lay.addWidget(out)
-        inp = QGroupBox("Microphone (input)")
-        i = QHBoxLayout(inp)
-        self.mic = QSlider(Qt.Orientation.Horizontal)
-        self.mic.setRange(0, 150)
-        self.mic_lbl = QLabel("0%")
-        self.mic_mute = QCheckBox("Mute")
-        i.addWidget(self.mic)
-        i.addWidget(self.mic_lbl)
-        i.addWidget(self.mic_mute)
-        lay.addWidget(inp)
-        r = QPushButton("Refresh devices")
-        r.clicked.connect(self.refresh_audio)
-        lay.addWidget(r)
-        lay.addStretch()
-        self.vol.valueChanged.connect(lambda v: self.set_vol("sinks", self.sink, v, self.vol_lbl))
-        self.mic.valueChanged.connect(lambda v: self.set_vol("sources", self.source, v, self.mic_lbl))
-        self.vol_mute.toggled.connect(lambda m: self.set_mute("sinks", self.sink, m))
-        self.mic_mute.toggled.connect(lambda m: self.set_mute("sources", self.source, m))
-        self.sink = self.source = None
-        return w
+        top = QHBoxLayout(w)
 
-    def refresh_audio(self):
-        self.sink, self.source = find_mh650("sinks"), find_mh650("sources")
-        self.snd_info.setText(f"Output: {self.sink or 'not found'}\nInput: {self.source or 'not found'}")
-        for kind, name, sl, lbl, mu in (("sinks", self.sink, self.vol, self.vol_lbl, self.vol_mute),
-                                        ("sources", self.source, self.mic, self.mic_lbl, self.mic_mute)):
-            sl.setEnabled(bool(name))
-            mu.setEnabled(bool(name))
-            if name:
-                v = pa_volume(kind, name)
-                for wdg in (sl, mu):
-                    wdg.blockSignals(True)
-                sl.setValue(v or 0)
-                lbl.setText(f"{v or 0}%")
-                mu.setChecked(pa_muted(kind, name))
-                for wdg in (sl, mu):
-                    wdg.blockSignals(False)
+        left = QVBoxLayout()
+        lv = QGroupBox("LEVELS")
+        lg = QHBoxLayout(lv)
+        self.vol = vslider(0, 100, 50)
+        self.vol.setTickInterval(25)
+        self.vol.valueChanged.connect(lambda v: self.set_level("sinks", v))
+        self.vol_mute = QCheckBox("MUTE")
+        self.vol_mute.toggled.connect(lambda m: self.set_mute_state("sinks", m))
+        self.mic = vslider(0, 100, 50)
+        self.mic.setTickInterval(25)
+        self.mic.valueChanged.connect(lambda v: self.set_level("sources", v))
+        self.mic_mute = QCheckBox("MUTE")
+        self.mic_mute.toggled.connect(lambda m: self.set_mute_state("sources", m))
+        a = column("VOL", self.vol)
+        a.addWidget(self.vol_mute)
+        b = column("MIC", self.mic)
+        b.addWidget(self.mic_mute)
+        lg.addLayout(a)
+        lg.addLayout(b)
+        left.addWidget(lv)
+        self.ctrl_note = QLabel("")
+        left.addWidget(self.ctrl_note)
 
-    def set_vol(self, kind, name, v, lbl):
-        lbl.setText(f"{v}%")
-        if name and PACTL:
-            sh(PACTL, f"set-{kind[:-1]}-volume", name, f"{v}%")
+        self.eq_enable = QCheckBox("EQ ENABLE")
+        self.eq_enable.setChecked(True)
+        self.eq_enable.toggled.connect(lambda _: self.eq_debounce.start())
+        self.eq_default = QCheckBox("Apply to system output")
+        self.eq_default.setChecked(True)
+        left.addWidget(self.eq_enable)
+        left.addWidget(self.eq_default)
+        left.addStretch(1)
+        top.addLayout(left)
 
-    def set_mute(self, kind, name, m):
-        if name and PACTL:
-            sh(PACTL, f"set-{kind[:-1]}-mute", name, "1" if m else "0")
+        mid = QVBoxLayout()
+        tone = QGroupBox("BASS / TREBLE")
+        tg = QHBoxLayout(tone)
+        self.bass = vslider(core.UI_MIN, core.UI_MAX)
+        self.treble = vslider(core.UI_MIN, core.UI_MAX)
+        self.bass_lbl, self.treble_lbl = QLabel("0"), QLabel("0")
+        for s, l in ((self.bass, self.bass_lbl), (self.treble, self.treble_lbl)):
+            s.valueChanged.connect(lambda v, l=l: l.setText(str(v)))
+            s.valueChanged.connect(self.eq_edited)
+        tg.addLayout(column("BASS", self.bass, self.bass_lbl))
+        tg.addLayout(column("TREBLE", self.treble, self.treble_lbl))
+        mid.addWidget(tone)
 
-    # ---- EQ / bass
-    def tab_eq(self):
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        top = QHBoxLayout()
-        self.preset = QComboBox()
-        self.preset.addItems(EQ_PRESETS.keys())
-        self.preset.currentTextChanged.connect(self.load_preset)
-        top.addWidget(QLabel("Preset"))
-        top.addWidget(self.preset)
-        top.addStretch()
-        self.eq_status = QLabel("EQ inactive")
-        top.addWidget(self.eq_status)
-        lay.addLayout(top)
+        eqb = QGroupBox("EQUALIZER")
+        eg = QHBoxLayout(eqb)
+        scale = QVBoxLayout()
+        for t in ("10dB", "0dB", "-10dB"):
+            scale.addWidget(QLabel(t), alignment=Qt.AlignmentFlag.AlignHCenter)
+            scale.addStretch(1)
+        eg.addLayout(scale)
+        self.band = []
+        self.band_lbl = []
+        for lab in core.BAND_LABELS:
+            s = vslider(core.UI_MIN, core.UI_MAX)
+            vl = QLabel("0")
+            s.valueChanged.connect(lambda v, l=vl: l.setText(str(v)))
+            s.valueChanged.connect(self.eq_edited)
+            self.band.append(s)
+            self.band_lbl.append(vl)
+            eg.addLayout(column(lab, s, vl))
+        mid.addWidget(eqb, 1)
+        top.addLayout(mid, 2)
 
-        shelves = QGroupBox("Bass / Treble (dB)")
-        s = QFormLayout(shelves)
-        self.bass = self.mk_slider(-12, 12, 0)
-        self.treble = self.mk_slider(-12, 12, 0)
-        s.addRow("Bass", self.bass)
-        s.addRow("Treble", self.treble)
-        lay.addWidget(shelves)
-
-        bands = QGroupBox("10-band equalizer (dB)")
-        h = QHBoxLayout(bands)
-        self.bands = []
-        for f in EQ_FREQS:
-            col = QVBoxLayout()
-            sl = QSlider(Qt.Orientation.Vertical)
-            sl.setRange(-12, 12)
-            sl.setMinimumHeight(150)
-            val = QLabel("0")
-            val.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            sl.valueChanged.connect(lambda v, val=val: val.setText(str(v)))
-            name = QLabel(f"{f // 1000}k" if f >= 1000 else str(f))
-            name.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            col.addWidget(val)
-            col.addWidget(sl, 1, Qt.AlignmentFlag.AlignHCenter)
-            col.addWidget(name)
-            h.addLayout(col)
-            self.bands.append(sl)
-        lay.addWidget(bands)
-
+        right = QVBoxLayout()
+        right.addWidget(QLabel("SOUND PROFILES"))
+        self.eq_list = QListWidget()
+        self.eq_list.currentRowChanged.connect(self.eq_mode_selected)
+        self.eq_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.eq_list.customContextMenuRequested.connect(lambda p: self.list_menu(self.eq_list, p, "eq"))
+        right.addWidget(self.eq_list, 1)
+        add = QPushButton("ADD NEW PROFILE")
+        add.clicked.connect(self.add_eq_mode)
+        right.addWidget(add)
         row = QHBoxLayout()
-        self.eq_btn = QPushButton("Apply / enable EQ")
-        self.eq_btn.clicked.connect(self.apply_eq)
-        live = QPushButton("Update gains (live)")
-        live.setToolTip("Change band gains without restarting PipeWire (only works while EQ is already active).")
-        live.clicked.connect(self.update_eq_live)
-        off = QPushButton("Disable EQ")
-        off.clicked.connect(self.stop_eq)
-        row.addWidget(self.eq_btn)
-        row.addWidget(live)
-        row.addWidget(off)
-        lay.addLayout(row)
-        n = QLabel(
-            "Apply writes a filter-chain into ~/.config/pipewire/pipewire.conf.d/ and restarts "
-            "PipeWire (brief audio drop). The new 'MH650 EQ' sink becomes the default output and "
-            "routes to your headset. 'Update gains (live)' adjusts bands without a restart once EQ is running. "
-            "Do not run EQ and 7.1 at the same time."
-        )
-        n.setWordWrap(True)
-        lay.addWidget(n)
+        for text, fn in (("RESET", self.eq_reset), ("SAVE", self.eq_save), ("CANCEL", self.eq_cancel)):
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        right.addLayout(row)
+        self.eq_info = QLabel("")
+        self.eq_info.setWordWrap(True)
+        self.eq_info.setStyleSheet("color:gray;font-size:10px;")
+        right.addWidget(self.eq_info)
+        top.addLayout(right, 1)
         return w
 
-    def mk_slider(self, lo, hi, v):
-        sl = QSlider(Qt.Orientation.Horizontal)
-        sl.setRange(lo, hi)
-        sl.setValue(v)
-        sl.setTickInterval(3)
-        sl.setTickPosition(QSlider.TickPosition.TicksBelow)
-        return sl
+    def list_menu(self, lst, pos, kind):
+        item = lst.itemAt(pos)
+        if not item:
+            return
+        m = QMenu(self)
+        ren, dele = m.addAction("Rename"), m.addAction("Delete")
+        act = m.exec(lst.mapToGlobal(pos))
+        mid = item.data(Qt.ItemDataRole.UserRole)
+        if act is ren:
+            name, ok = QInputDialog.getText(self, "Rename", "Name:", text=item.text())
+            if ok and name.strip():
+                (self.store.eq_mode(mid) if kind == "eq" else self.store.virtual(mid))["name"] = name.strip()
+                self.store.save()
+                self.fill_lists()
+        elif act is dele:
+            (self.store.del_eq_mode if kind == "eq" else self.store.del_virtual)(mid)
+            self.store.save()
+            self.load_profile_into_ui()
 
-    def load_preset(self, name):
-        bass, bands, treble = EQ_PRESETS[name]
-        self.bass.setValue(bass)
-        self.treble.setValue(treble)
-        for sl, g in zip(self.bands, bands):
-            sl.setValue(g)
+    def fill_lists(self):
+        self.eq_list.blockSignals(True)
+        self.eq_list.clear()
+        for m in self.store.eq_modes:
+            it = QListWidgetItem(m["name"])
+            it.setData(Qt.ItemDataRole.UserRole, m["id"])
+            self.eq_list.addItem(it)
+            if m["id"] == self.store.eq_cur:
+                self.eq_list.setCurrentItem(it)
+        self.eq_list.blockSignals(False)
+        self.sur_list.blockSignals(True)
+        self.sur_list.clear()
+        for v in self.store.virtuals:
+            it = QListWidgetItem(v["name"])
+            it.setData(Qt.ItemDataRole.UserRole, v["id"])
+            self.sur_list.addItem(it)
+            if v["id"] == self.store.virt_cur:
+                self.sur_list.setCurrentItem(it)
+        self.sur_list.blockSignals(False)
+
+    def load_profile_into_ui(self):
+        self.fill_lists()
+        self.load_eq_mode(self.store.eq_cur, apply=False)
+        self.load_virtual(self.store.virt_cur, apply=False)
+        if self.store.virtual(self.store.virt_cur)["VssEnable"]:
+            self.sur_debounce.start()
+        self.eq_debounce.start()
+
+    def load_eq_mode(self, mid, apply=True):
+        m = self.store.eq_mode(mid) or self.store.eq_modes[0]
+        self.store.eq_cur = m["id"]
+        widgets = [self.bass, self.treble] + self.band
+        for s in widgets:
+            s.blockSignals(True)
+        self.bass.setValue(self.store.bass)
+        self.treble.setValue(self.store.treble)
+        for s, v in zip(self.band, m["bands"]):
+            s.setValue(max(core.UI_MIN, min(core.UI_MAX, v)))
+        for s in widgets:
+            s.blockSignals(False)
+        self.bass_lbl.setText(str(self.bass.value()))
+        self.treble_lbl.setText(str(self.treble.value()))
+        for s, l in zip(self.band, self.band_lbl):
+            l.setText(str(s.value()))
+        if apply:
+            self.eq_debounce.start()
+
+    def eq_mode_selected(self, row):
+        it = self.eq_list.item(row)
+        if it:
+            self.load_eq_mode(it.data(Qt.ItemDataRole.UserRole))
+
+    def eq_edited(self):
+        self.eq_debounce.start()
+
+    def add_eq_mode(self):
+        name, ok = QInputDialog.getText(self, "ADD NEW PROFILE", "Name:")
+        if ok and name.strip():
+            mid = self.store.add_eq_mode(name.strip())
+            self.store.eq_cur = mid
+            self.store.save()
+            self.fill_lists()
+            self.load_eq_mode(mid)
+
+    def eq_reset(self):
+        for s in [self.bass, self.treble] + self.band:
+            s.setValue(0)
+
+    def eq_save(self):
+        m = self.store.eq_mode(self.store.eq_cur)
+        m["bands"] = [s.value() for s in self.band]
+        self.store.bass, self.store.treble = self.bass.value(), self.treble.value()
+        self.store.save()
+        self.log(f"saved sound profile '{m['name']}'")
+
+    def eq_cancel(self):
+        self.load_eq_mode(self.store.eq_cur)
+
+    def current_cmeq(self):
+        return core.eq_to_driver(self.bass.value(), self.treble.value(), [s.value() for s in self.band])
 
     def apply_eq(self):
-        ok, msg = tools_ok()
-        if not ok:
-            self.warn(msg)
+        try:
+            cmeq = self.current_cmeq()
+        except core.EQError as e:
+            self.log(f"EQ rejected like the Windows driver would: {e}")
             return
-        target = find_mh650("sinks")
-        if not target:
-            reply = QMessageBox.question(
-                self, "No MH650 sink",
-                "No Cooler Master / MH650 sink was found. Continue and let WirePlumber choose the default target?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            )
-            if reply != QMessageBox.StandardButton.Yes:
+        props = ", ".join(f"{n}={v}" for n, _, v in core.driver_properties(cmeq) if v)
+        self.eq_info.setText("Driver slots: " + (props or "all 0 (flat)"))
+        flat = not any(cmeq)
+        if not self.eq_enable.isChecked() or flat and not self.eq_proc.running():
+            if not self.eq_enable.isChecked():
+                self.stop_eq()
+            return
+        if not core.find_bin("pipewire"):
+            self.log("`pipewire` binary not found; EQ cannot be applied")
+            return
+        try:
+            if self.eq_proc.running() and self.eq_proc.set_params(core.eq_live_params(cmeq)):
                 return
-            target = None
+            self.start_eq(cmeq)
+        except OSError as e:
+            self.log(f"EQ start failed: {e}")
+            self.status.showMessage(f"EQ failed: {e}")
 
-        if self.sur_active:
-            self.warn("Disable 7.1 Surround first (both replace the default sink).")
-            return
+    def mh650_sink(self):
+        found = core.find_mh650("sinks")
+        return found[0] if found else None
 
-        bass = self.bass.value()
-        bands = [s.value() for s in self.bands]
-        treble = self.treble.value()
-        conf = build_eq_conf(bass, bands, treble, target)
-        write_conf(EQ_CONF_NAME, conf, self.log)
-        self.log(f"Using pactl={PACTL}  pw-cli={PW_CLI}")
-        self.log("Restarting PipeWire to load EQ…")
-        self.eq_status.setText("Restarting PipeWire…")
-        QApplication.processEvents()
-        if not restart_pipewire(self.log):
-            self.eq_status.setText("EQ conf written; restart failed")
-            self.warn("Could not restart PipeWire. Try: systemctl --user restart pipewire wireplumber pipewire-pulse")
-            return
-
-        sink = None
-        for _ in range(20):
-            sink = find_sink_by_name(EQ_SINK_NAME)
-            if sink:
-                break
-            time.sleep(0.3)
+    def start_eq(self, cmeq):
+        sink = self.mh650_sink()
         if not sink:
-            self.eq_status.setText("EQ conf loaded but sink not visible")
-            self.warn(f"After restart, sink '{EQ_SINK_NAME}' did not appear. Check journalctl --user -u pipewire.")
-            return
-
-        sh(PACTL, "set-default-sink", EQ_SINK_NAME)
-        self.eq_node_id = pw_node_id_by_name(EQ_SINK_NAME)
-        self.eq_active = True
-        self.eq_status.setText(f"EQ active (node {self.eq_node_id or '?'})")
-        self.log(f"EQ enabled → default sink {EQ_SINK_NAME}")
-        self.refresh_audio()
-
-    def update_eq_live(self):
-        if not self.eq_active:
-            self.warn("EQ is not active. Press 'Apply / enable EQ' first.")
-            return
-        if not self.eq_node_id:
-            self.eq_node_id = pw_node_id_by_name(EQ_SINK_NAME)
-        if not self.eq_node_id:
-            self.warn("Could not find EQ node id. Re-apply EQ.")
-            return
-        ok = pw_set_eq_gains(
-            self.eq_node_id,
-            self.bass.value(),
-            [s.value() for s in self.bands],
-            self.treble.value(),
-            self.log,
-        )
-        if ok:
-            self.log("EQ gains updated live")
-            self.statusBar().showMessage("EQ gains updated", 3000)
+            raise OSError("MH650 audio output not found (is the headset connected and set up in PipeWire?)")
+        self.eq_proc.start(core.build_eq_conf(cmeq, sink))
+        self.log(f"EQ filter-chain started -> {sink}")
+        if self.eq_default.isChecked():
+            core.set_default_sink("effect_input.mh650_eq")
+        if self.sur_proc.running():
+            self.sur_debounce.start()
 
     def stop_eq(self):
-        remove_conf(EQ_CONF_NAME, self.log)
-        self.log("Restarting PipeWire to unload EQ…")
-        restart_pipewire(self.log)
-        self.eq_active = False
-        self.eq_node_id = None
-        self.eq_status.setText("EQ inactive")
-        sink = find_mh650("sinks")
-        if sink and PACTL:
-            sh(PACTL, "set-default-sink", sink)
-            self.log(f"Default sink restored to {sink}")
-        self.refresh_audio()
+        was = self.eq_proc.running()
+        self.eq_proc.stop()
+        if was:
+            sink = self.mh650_sink()
+            if sink and self.eq_default.isChecked():
+                core.set_default_sink(sink)
+            self.log("EQ stopped")
 
-    # ---- surround
-    def tab_surround(self):
+    # ------------------------------------------------------------------ audio levels
+    def refresh_audio(self):
+        for kind, slider, mute in (("sinks", self.vol, self.vol_mute), ("sources", self.mic, self.mic_mute)):
+            f = core.find_mh650(kind)
+            if not f or slider.isSliderDown():
+                continue
+            _, pct, muted = f
+            slider.blockSignals(True)
+            mute.blockSignals(True)
+            slider.setValue(pct)
+            mute.setChecked(muted)
+            slider.blockSignals(False)
+            mute.blockSignals(False)
+
+    def set_level(self, kind, v):
+        f = core.find_mh650(kind)
+        if f:
+            core.set_volume(kind, f[0], v)
+
+    def set_mute_state(self, kind, m):
+        f = core.find_mh650(kind)
+        if f:
+            core.set_mute(kind, f[0], m)
+
+    # ------------------------------------------------------------------ SURROUND
+    def page_surround(self):
         w = QWidget()
-        lay = QVBoxLayout(w)
-        info = QLabel(
-            "Virtual 7.1 surround through PipeWire's HRIR convolver. Choose a HeSuVi-format "
-            "HRIR .wav file (14-channel, e.g. Atmos / CMSS-3D from the HeSuVi project). "
-            "It is not bundled here."
-        )
-        info.setWordWrap(True)
-        lay.addWidget(info)
+        top = QHBoxLayout(w)
+        left = QVBoxLayout()
+        left.addWidget(QLabel("7.1 SURROUND SOUND PROFILES"))
+        self.sur_list = QListWidget()
+        self.sur_list.currentRowChanged.connect(self.virtual_selected)
+        self.sur_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.sur_list.customContextMenuRequested.connect(lambda p: self.list_menu(self.sur_list, p, "virt"))
+        left.addWidget(self.sur_list, 1)
+        add = QPushButton("ADD NEW PROFILE")
+        add.clicked.connect(self.add_virtual)
+        left.addWidget(add)
+        self.vss = QCheckBox("ENABLE 7.1 VIRTUAL SURROUND")
+        self.vss.toggled.connect(self.vss_toggled)
+        self.smvss = QCheckBox("SMVSS")
+        self.smvss.toggled.connect(self.smvss_toggled)
+        left.addWidget(self.vss)
+        left.addWidget(self.smvss)
+        self.sofa_lbl = QLabel()
+        self.sofa_lbl.setWordWrap(True)
+        pick = QPushButton("Choose HRTF (.sofa)...")
+        pick.clicked.connect(self.pick_sofa)
+        left.addWidget(self.sofa_lbl)
+        left.addWidget(pick)
         row = QHBoxLayout()
-        self.hrir = QLineEdit(self.cfg.value("hrir", ""))
-        browse = QPushButton("Browse...")
-        browse.clicked.connect(self.pick_hrir)
-        row.addWidget(self.hrir)
-        row.addWidget(browse)
-        lay.addLayout(row)
-        self.sur_status = QLabel("7.1 inactive")
-        lay.addWidget(self.sur_status)
-        b = QHBoxLayout()
-        on = QPushButton("Enable 7.1")
-        on.clicked.connect(self.start_surround)
-        off = QPushButton("Disable 7.1")
-        off.clicked.connect(self.stop_surround)
-        b.addWidget(on)
-        b.addWidget(off)
-        lay.addLayout(b)
-        n = QLabel(
-            "Enable writes a filter-chain into ~/.config/pipewire/pipewire.conf.d/ and restarts "
-            "PipeWire. Set games/apps to 7.1 output (or make the virtual sink default). "
-            "Do not run this and the EQ at the same time."
-        )
-        n.setWordWrap(True)
-        lay.addWidget(n)
-        lay.addStretch()
+        for text, fn in (("RESET", self.sur_reset), ("SAVE", self.sur_save), ("CANCEL", self.sur_cancel)):
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        left.addLayout(row)
+        top.addLayout(left, 1)
+
+        right = QVBoxLayout()
+        right.addWidget(QLabel("7.1 VIRTUAL SPEAKER PLACEMENT"))
+        self.stage = StageWidget()
+        self.stage.changed.connect(self.stage_changed)
+        self.stage.selected.connect(self.speaker_selected)
+        right.addWidget(self.stage, 1)
+        dist = QGroupBox("SURROUND SOUND DISTANCE")
+        dl = QHBoxLayout(dist)
+        near = QPushButton("NEAR")
+        far = QPushButton("FAR")
+        near.clicked.connect(lambda: self.nudge_distance(-5))
+        far.clicked.connect(lambda: self.nudge_distance(+5))
+        self.dist_slider = QSlider(Qt.Orientation.Horizontal)
+        self.dist_slider.setRange(0, 100)
+        self.dist_slider.valueChanged.connect(self.distance_changed)
+        self.sel_lbl = QLabel("C")
+        dl.addWidget(self.sel_lbl)
+        dl.addWidget(near)
+        dl.addWidget(self.dist_slider, 1)
+        dl.addWidget(far)
+        right.addWidget(dist)
+        rot = QGroupBox("SURROUND SOUND ROTATION")
+        rl = QHBoxLayout(rot)
+        self.cw = QPushButton("CLOCKWISE")
+        self.ccw = QPushButton("COUNTER-CLOCKWISE")
+        for b in (self.cw, self.ccw):
+            b.setCheckable(True)
+        self.cw.toggled.connect(lambda on: self.rotate_toggled(+1, on))
+        self.ccw.toggled.connect(lambda on: self.rotate_toggled(-1, on))
+        rl.addWidget(self.ccw)
+        rl.addWidget(self.cw)
+        right.addWidget(rot)
+        top.addLayout(right, 2)
+        self.update_sofa_label()
         return w
 
-    def pick_hrir(self):
-        p, _ = QFileDialog.getOpenFileName(self, "HRIR wav", os.path.expanduser("~"), "WAV (*.wav)")
+    def update_sofa_label(self):
+        if self.sofa:
+            self.sofa_lbl.setText(f"HRTF: {os.path.basename(self.sofa)}")
+        else:
+            self.sofa_lbl.setText("No .sofa HRTF file found. Virtual surround needs one "
+                                  "(e.g. from the 'sofa'/'hrtf' packages or sofacoustics.org).")
+
+    def pick_sofa(self):
+        p, _ = QFileDialog.getOpenFileName(self, "HRTF", os.path.expanduser("~"), "SOFA (*.sofa)")
         if p:
-            self.hrir.setText(p)
-            self.cfg.setValue("hrir", p)
+            self.sofa = p
+            self.update_sofa_label()
+            self.sur_debounce.start()
 
-    def start_surround(self):
-        p = self.hrir.text().strip()
-        if not os.path.isfile(p):
-            self.warn("Choose an existing HeSuVi-format HRIR .wav file first.")
-            return
-        ok, msg = tools_ok()
-        if not ok:
-            self.warn(msg)
-            return
-        if self.eq_active:
-            self.warn("Disable EQ first (both replace the default sink).")
-            return
+    def virt(self):
+        return self.virt_cur
 
-        target = find_mh650("sinks")
+    def load_virtual(self, vid, apply=True):
+        v = self.store.virtual(vid) or self.store.virtuals[0]
+        self.store.virt_cur = v["id"]
+        self.virt_cur = dict(v, distance=list(v["distance"]), angle=list(v["angle"]))
+        self.stage.set_data(self.virt_cur["angle"], self.virt_cur["distance"])
+        for cb, key in ((self.vss, "VssEnable"), (self.smvss, "SmvssEnable")):
+            cb.blockSignals(True)
+            cb.setChecked(bool(self.virt_cur[key]))
+            cb.blockSignals(False)
+        self.speaker_selected(self.stage.sel)
+        if apply:
+            self.sur_debounce.start()
+
+    def virtual_selected(self, row):
+        it = self.sur_list.item(row)
+        if it:
+            self.load_virtual(it.data(Qt.ItemDataRole.UserRole))
+
+    def add_virtual(self):
+        name, ok = QInputDialog.getText(self, "ADD NEW PROFILE", "Name:")
+        if ok and name.strip():
+            vid = self.store.add_virtual(name.strip())
+            self.store.virt_cur = vid
+            self.store.save()
+            self.fill_lists()
+            self.load_virtual(vid)
+
+    def speaker_selected(self, i):
+        self.sel_lbl.setText(core.SPEAKERS[i])
+        self.dist_slider.blockSignals(True)
+        self.dist_slider.setValue(self.virt_cur["distance"][i])
+        self.dist_slider.blockSignals(False)
+
+    def stage_changed(self):
+        self.virt_cur["angle"] = list(self.stage.angles)
+        self.virt_cur["distance"] = list(self.stage.dists)
+        self.speaker_selected(self.stage.sel)
+        self.sur_debounce.start()
+
+    def distance_changed(self, v):
+        self.stage.dists[self.stage.sel] = v
+        self.stage.update()
+        self.stage_changed()
+
+    def nudge_distance(self, d):
+        self.dist_slider.setValue(max(0, min(100, self.dist_slider.value() + d)))
+
+    def rotate_toggled(self, direction, on):
+        other = self.ccw if direction == +1 else self.cw
+        if on:
+            other.blockSignals(True)
+            other.setChecked(False)
+            other.blockSignals(False)
+            self.rot_dir = direction
+            self.rot_timer.start()
+        elif self.rot_dir == direction:
+            self.rot_dir = 0
+            self.rot_timer.stop()
+
+    def rot_tick(self):
+        for i in range(7):                                   # LFE keeps its angle
+            self.stage.angles[i] = core.wrap_angle(self.stage.angles[i] + 3 * self.rot_dir)
+        self.stage.update()
+        self.stage_changed()
+
+    def vss_toggled(self, on):
+        self.virt_cur["VssEnable"] = int(on)
+        self.sur_debounce.start()
+
+    def smvss_toggled(self, on):
+        self.virt_cur["SmvssEnable"] = int(on)
+
+    def sur_reset(self):
+        d = core.VIRTUAL_DEFAULT
+        self.virt_cur["angle"], self.virt_cur["distance"] = list(d["angle"]), list(d["distance"])
+        self.stage.set_data(self.virt_cur["angle"], self.virt_cur["distance"])
+        self.speaker_selected(self.stage.sel)
+        self.sur_debounce.start()
+
+    def sur_save(self):
+        v = self.store.virtual(self.store.virt_cur)
+        v.update(self.virt_cur)
+        self.store.save()
+        self.log(f"saved surround profile '{v['name']}'")
+
+    def sur_cancel(self):
+        self.load_virtual(self.store.virt_cur)
+
+    def apply_surround(self):
+        v = self.virt_cur
+        if not v.get("VssEnable"):
+            if self.sur_proc.running():
+                self.sur_proc.stop()
+                self.log("virtual surround stopped")
+                if self.eq_default.isChecked():
+                    core.set_default_sink("effect_input.mh650_eq" if self.eq_proc.running() else (self.mh650_sink() or ""))
+            return
+        if not self.sofa:
+            self.log("virtual surround needs a .sofa HRTF file (choose one on the SURROUND page)")
+            return
         try:
-            conf, n = build_surround_conf(p, target)
-        except RuntimeError as e:
-            self.warn(str(e))
-            return
+            if self.sur_proc.running() and self.sur_proc.set_params(core.surround_live_params(v)):
+                return
+            target = "effect_input.mh650_eq" if self.eq_proc.running() else self.mh650_sink()
+            if not target:
+                raise OSError("MH650 audio output not found")
+            self.sur_proc.start(core.build_surround_conf(v, self.sofa, target))
+            self.log(f"virtual surround started -> {target}")
+            if self.eq_default.isChecked():
+                core.set_default_sink("effect_input.mh650_surround")
+        except OSError as e:
+            self.log(f"virtual surround failed: {e}")
+            self.status.showMessage(f"Virtual surround failed: {e}")
 
-        write_conf(SUR_CONF_NAME, conf, self.log)
-        self.log(f"Using pactl={PACTL}  pw-cli={PW_CLI}")
-        self.log(f"Surround conf: {n} convolver filename(s) rewritten → restarting PipeWire…")
-        self.sur_status.setText("Restarting PipeWire…")
-        QApplication.processEvents()
-        if not restart_pipewire(self.log):
-            self.sur_status.setText("Conf written; restart failed")
-            self.warn("Could not restart PipeWire. Try: systemctl --user restart pipewire wireplumber pipewire-pulse")
-            return
-
-        sink = None
-        for _ in range(25):
-            sink = find_sink_by_name(SUR_SINK_NAME)
-            if sink:
-                break
-            time.sleep(0.3)
-        if not sink:
-            self.sur_status.setText("Conf loaded but sink not visible")
-            self.warn(
-                f"After restart, sink '{SUR_SINK_NAME}' did not appear. "
-                "Check that the HRIR is a 14-channel HeSuVi wav and look at "
-                "journalctl --user -u pipewire for convolver errors."
-            )
-            return
-
-        sh(PACTL, "set-default-sink", SUR_SINK_NAME)
-        self.sur_active = True
-        self.sur_status.setText("7.1 active")
-        self.log(f"7.1 enabled → default sink {SUR_SINK_NAME}")
-        self.refresh_audio()
-
-    def stop_surround(self):
-        remove_conf(SUR_CONF_NAME, self.log)
-        self.log("Restarting PipeWire to unload 7.1…")
-        restart_pipewire(self.log)
-        self.sur_active = False
-        self.sur_status.setText("7.1 inactive")
-        sink = find_mh650("sinks")
-        if sink and PACTL:
-            sh(PACTL, "set-default-sink", sink)
-            self.log(f"Default sink restored to {sink}")
-        self.refresh_audio()
-
-    # ---- log
-    def tab_log(self):
+    # ------------------------------------------------------------------ LOG / lifecycle
+    def page_log(self):
         w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.addWidget(QLabel("Raw reports from the headset (press its buttons / plug the charger):"))
-        self.logbox = QPlainTextEdit()
-        self.logbox.setReadOnly(True)
-        lay.addWidget(self.logbox)
+        l = QVBoxLayout(w)
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        l.addWidget(self.log_view)
         return w
-
+    
     def closeEvent(self, ev):
-        self.fx_timer.stop()
+        for t in (self.fx_timer, self.rot_timer, self.audio_timer, self.eq_debounce, self.sur_debounce):
+            t.stop()
         if self.events:
             self.events.stop()
-        self.light.close()
-        # Leave EQ / surround confs in place so they survive app exit.
-        # User can Disable them from the tabs if they want them gone.
-        super().closeEvent(ev)
+        # leave eq_proc / sur_proc running so the effect survives closing the window
+        self.hid.close()
+        ev.accept()
 
 
 def main():
+    if "--install-udev" in sys.argv:
+        try:
+            core.install_udev_rule_with_pkexec()
+            print("udev rule installed. Re-plug the headset if it is still not accessible.")
+            return 0
+        except OSError as e:
+            print(f"failed: {e}", file=sys.stderr)
+            return 1
+    if "--print-udev-rule" in sys.argv:
+        print(core.UDEV_RULE, end="")
+        return 0
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-    pal = QPalette()
-    pal.setColor(QPalette.ColorRole.Window, QColor(37, 37, 41))
-    pal.setColor(QPalette.ColorRole.WindowText, QColor(230, 230, 230))
-    pal.setColor(QPalette.ColorRole.Base, QColor(27, 27, 30))
-    pal.setColor(QPalette.ColorRole.Text, QColor(230, 230, 230))
-    pal.setColor(QPalette.ColorRole.Button, QColor(52, 52, 58))
-    pal.setColor(QPalette.ColorRole.ButtonText, QColor(230, 230, 230))
-    pal.setColor(QPalette.ColorRole.Highlight, QColor(60, 140, 230))
-    app.setPalette(pal)
-    win = MainWindow()
-    win.show()
-    sys.exit(app.exec())
+    w = MainWindow()
+    w.show()
+    return app.exec()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
